@@ -13,12 +13,15 @@
 #include "colmap/estimators/solvers/similarity_transform.h"
 #include "colmap/estimators/view_graph_calibration.h"
 #include "colmap/exe/gui.h"
+#include "colmap/scene/database_cache.h"
 #include "colmap/scene/reconstruction.h"
+#include "colmap/sfm/incremental_mapper.h"
 #include "colmap/sfm/observation_manager.h"
 #include "colmap/util/cancellation.h"
 #include "colmap/util/file.h"
 #include "colmap/util/misc.h"
 #include "colmap/util/opengl_utils.h"
+#include "colmap/util/string.h"
 
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -814,6 +817,183 @@ int RunSingleViewCalibrator(int argc, char** argv) {
   calibrator->Wait();
 
   return EXIT_SUCCESS;
+}
+
+namespace {
+
+// Shared implementation of the Detector-Free SfM "incremental_model_refiner"
+// command. It runs iterative global bundle adjustment on an existing
+// reconstruction, followed by track completion/merging and 3D point filtering,
+// and finally writes the refined model back to disk.
+//
+// This is a port of the custom command that the Detector-Free SfM authors added
+// to COLMAP 3.7 (https://github.com/hxy-123/colmap, commit "ADD: Detector-Free
+// SfM's requirement model_refinement part") onto the current COLMAP API. The
+// original implementation drove a custom bundle adjustment loop through the
+// (now removed) `IncrementalMapperOptions` / `DatabaseCache` combination; here
+// the equivalent modern `IncrementalMapper` refinement primitives are used.
+//
+// Differences to the original implementation:
+//   * Parallel bundle adjustment (PBA, `Mapper.ba_global_use_pba`) no longer
+//     exists upstream and is accepted but ignored.
+//   * Instead of pinning the farthest image pair, the standard
+//     `BundleAdjustmentGauge::TWO_CAMS_FROM_WORLD` gauge is used. Both fix the
+//     7-DoF gauge of the problem and only differ by a similarity transform.
+//   * `Mapper.fix_existing_images` was renamed to
+//     `Mapper.fix_existing_frames`; the old spelling is still accepted.
+int RunIncrementalModelRefinerWithOptions(
+    const std::shared_ptr<Reconstruction>& reconstruction,
+    const std::filesystem::path& database_path,
+    const std::filesystem::path& image_path,
+    const std::filesystem::path& output_path,
+    const std::filesystem::path& image_list_path,
+    const IncrementalPipelineOptions& options,
+    const bool no_filter_pts) {
+  THROW_CHECK_GE(reconstruction->NumRegImages(), 2)
+      << "Need at least two images for refinement";
+
+  // Images whose poses are expected to stay constant. In triangulation mode the
+  // caller writes the names of all registered images into this file.
+  std::vector<image_t> fixed_image_ids;
+  if (!image_list_path.empty()) {
+    for (const std::string& image_name : ReadTextFileLines(image_list_path)) {
+      const Image* image = reconstruction->FindImageWithName(image_name);
+      if (image == nullptr) {
+        LOG(WARNING) << "Fixed image " << image_name
+                     << " is not part of the reconstruction and is ignored";
+      } else {
+        fixed_image_ids.push_back(image->ImageId());
+      }
+    }
+  }
+  LOG(INFO) << "Keeping " << fixed_image_ids.size()
+            << " image poses constant during refinement";
+
+  // The correspondence graph is required to complete and merge tracks after
+  // each bundle adjustment step.
+  DatabaseCache::Options database_cache_options;
+  database_cache_options.min_num_matches = options.min_num_matches;
+  database_cache_options.ignore_watermarks = options.ignore_watermarks;
+  database_cache_options.load_all_images = true;
+  for (const std::string& image_name : options.image_names) {
+    database_cache_options.image_names.insert(image_name);
+  }
+
+  const auto database = Database::Open(database_path);
+  const auto database_cache =
+      DatabaseCache::Create(*database, database_cache_options);
+
+  IncrementalMapper mapper(database_cache);
+  mapper.BeginReconstruction(reconstruction);
+
+  // `IncrementalPipelineOptions::Mapper()` propagates the top-level
+  // `fix_existing_frames` / `constant_cameras` / bundle adjustment options into
+  // the incremental mapper options used for global bundle adjustment.
+  const IncrementalMapper::Options mapper_options = options.Mapper();
+  const BundleAdjustmentOptions ba_options = options.GlobalBundleAdjustment();
+  const IncrementalTriangulator::Options tri_options = options.Triangulation();
+
+  for (int refinement = 0; refinement < options.ba_global_max_refinements;
+       ++refinement) {
+    const size_t num_observations = reconstruction->ComputeNumObservations();
+
+    LOG_HEADING1("Bundle adjustment");
+    if (!mapper.AdjustGlobalBundle(mapper_options, ba_options)) {
+      LOG(WARNING) << "Global bundle adjustment failed";
+      break;
+    }
+
+    size_t num_changed_observations = mapper.CompleteAndMergeTracks(tri_options);
+    if (!no_filter_pts) {
+      num_changed_observations += mapper.FilterPoints(mapper_options);
+    }
+    const double changed =
+        num_observations == 0
+            ? 0.0
+            : static_cast<double>(num_changed_observations) / num_observations;
+    LOG(INFO) << StringPrintf("  => Changed observations: %.6f", changed);
+    if (changed < options.ba_global_max_refinement_change) {
+      break;
+    }
+  }
+
+  if (options.extract_colors && !image_path.empty()) {
+    LOG_HEADING1("Extracting colors");
+    reconstruction->ExtractColorsForAllImages(image_path, options.num_threads);
+  }
+
+  mapper.EndReconstruction(/*discard=*/false);
+
+  reconstruction->Write(output_path);
+
+  return EXIT_SUCCESS;
+}
+
+int RunIncrementalModelRefinerCommand(int argc,
+                                      char** argv,
+                                      const bool no_filter_pts) {
+  std::filesystem::path input_path;
+  std::filesystem::path output_path;
+  std::filesystem::path image_list_path;
+  // Accepted for command line compatibility with the Detector-Free SfM fork.
+  // Parallel bundle adjustment is no longer part of COLMAP and is ignored.
+  bool ba_global_use_pba = false;
+  // Old spelling of the renamed `Mapper.fix_existing_frames` option.
+  bool fix_existing_images = false;
+
+  OptionManager options;
+  options.AddDatabaseOptions();
+  options.AddImageOptions();
+  options.AddRequiredOption("input_path", &input_path);
+  options.AddRequiredOption("output_path", &output_path);
+  options.AddDefaultOption("image_list_path", &image_list_path);
+  options.AddMapperOptions();
+  options.AddDefaultOption("Mapper.ba_global_use_pba", &ba_global_use_pba);
+  options.AddDefaultOption("Mapper.fix_existing_images", &fix_existing_images);
+  if (!options.Parse(argc, argv)) {
+    return EXIT_FAILURE;
+  }
+
+  if (!ExistsDir(input_path)) {
+    LOG(ERROR) << "`input_path` is not a directory";
+    return EXIT_FAILURE;
+  }
+
+  if (!ExistsDir(output_path)) {
+    LOG(ERROR) << "`output_path` is not a directory";
+    return EXIT_FAILURE;
+  }
+
+  if (ba_global_use_pba) {
+    LOG(WARNING) << "`Mapper.ba_global_use_pba` is no longer supported by "
+                    "COLMAP and will be ignored";
+  }
+  if (fix_existing_images) {
+    options.mapper->fix_existing_frames = true;
+  }
+
+  LOG_HEADING1("Loading model");
+
+  auto reconstruction = std::make_shared<Reconstruction>();
+  reconstruction->Read(input_path);
+
+  return RunIncrementalModelRefinerWithOptions(reconstruction,
+                                              *options.database_path,
+                                              *options.image_path,
+                                              output_path,
+                                              image_list_path,
+                                              *options.mapper,
+                                              no_filter_pts);
+}
+
+}  // namespace
+
+int RunIncrementalModelRefiner(int argc, char** argv) {
+  return RunIncrementalModelRefinerCommand(argc, argv, /*no_filter_pts=*/false);
+}
+
+int RunIncrementalModelRefinerNoFilterPts(int argc, char** argv) {
+  return RunIncrementalModelRefinerCommand(argc, argv, /*no_filter_pts=*/true);
 }
 
 }  // namespace colmap

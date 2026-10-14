@@ -129,6 +129,10 @@ int main(int argc, char** argv) {
   commands.emplace_back("image_undistorter_standalone",
                         &colmap::RunImageUndistorterStandalone,
                         kSupportsGracefulShutdown);
+  commands.emplace_back("incremental_model_refiner",
+                        &colmap::RunIncrementalModelRefiner);
+  commands.emplace_back("incremental_model_refiner_no_filter_pts",
+                        &colmap::RunIncrementalModelRefinerNoFilterPts);
   commands.emplace_back(
       "mapper", &colmap::RunMapper, kSupportsGracefulShutdown);
   commands.emplace_back("matches_importer",

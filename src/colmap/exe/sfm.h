@@ -49,6 +49,8 @@ bool RunHierarchicalMapperImpl(
 int RunAutomaticReconstructor(int argc, char** argv);
 int RunBundleAdjuster(int argc, char** argv);
 int RunColorExtractor(int argc, char** argv);
+int RunIncrementalModelRefiner(int argc, char** argv);
+int RunIncrementalModelRefinerNoFilterPts(int argc, char** argv);
 int RunMapper(int argc, char** argv);
 int RunGlobalMapper(int argc, char** argv);
 int RunHierarchicalMapper(int argc, char** argv);
